@@ -1,15 +1,16 @@
 # Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
+# Modified for Ampion utility api. no need for whitelisting domains
+# Remove the whitelist domains parameter
+# Remove the GetSecret Policy
+# Remove the Proxy-Domains-Whitelisting Secret
+# Remove the /root/fetch-config-cron.sh script
+# Remove the /etc/squid/squid.allowed.sites.txt file
 
 Description: Outbound filtering proxy
 
 Parameters:
 
-  WhitelistedDomains:
-    Type: String
-    Default: .amazonaws.com, .debian.org
-    Description: Whitelisted domains comma separated 
-  
   CustomDNS:
     Type: String
     Default: default
@@ -80,7 +81,6 @@ Metadata:
     - Label:
         default: Proxy parameter
       Parameters:
-      - WhitelistedDomains
       - CustomDNS  
       - ProxyPort
       - InstanceType
@@ -96,8 +96,6 @@ Metadata:
       - NetworkAllowedCIDR
 
     ParameterLabels:
-      WhitelistedDomains:
-        default: Allowed domains (whitelisted)
       CustomDNS:
         default: Custom DNS servers
       ProxyPort:
@@ -175,15 +173,6 @@ Resources:
             - ec2:Describe*
             Resource:
             - "*"
-      - PolicyName: GetSecret
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-            - secretsmanager:GetSecretValue
-            Resource:
-            - !Ref WhitelistedSitesSecret
       - PolicyName: CloudWatchMetric
         PolicyDocument:
           Version: '2012-10-17'
@@ -193,13 +182,6 @@ Resources:
             - cloudwatch:PutMetricData
             Resource:
             - "*"
-
-  WhitelistedSitesSecret:
-    Type: 'AWS::SecretsManager::Secret'
-    Properties:
-      Name: Proxy-Domains-Whitelisting
-      Description: This secret contains the proxy whitelisted domains 
-      SecretString: !Ref WhitelistedDomains
 
   FixedEIPa:
     Type: AWS::EC2::EIP
@@ -424,23 +406,6 @@ Resources:
               mode: '000755'
               owner: "root"
               group: "root"
-            "/root/fetch-config-cron.sh":
-              content: !Sub | 
-                 aws secretsmanager get-secret-value  --secret-id ${WhitelistedSitesSecret} --region ${AWS::Region} > ~/.tmp.hosts
-                 upstreamVersion=$(grep VersionId ~/.tmp.hosts) 
-                 hostVersion=$(cat ~/configVersion) || hostVersion="0"
-                 # update if config 
-                 if [[ $upstreamVersion != $hostVersion ]]; then
-                    mv /etc/squid/squid.allowed.sites.txt /etc/squid/squid.allowed.sites.txt.old
-                    grep SecretString ~/.tmp.hosts | sed  's/^.*SecretString\": \"\(.*\)\"\,/\1/' | tr -d " " | tr "," "\n" > /etc/squid/squid.allowed.sites.txt
-                    grep VersionId ~/.tmp.hosts > ~/configVersion
-                    systemctl restart squid
-                    echo "Squid config updated"
-                    logger "Squid config updated by cron-job from AWS secret store ${WhitelistedSitesSecret}"
-                 fi 
-              mode: '000755'
-              owner: "root"
-              group: "root"
             "/root/get-stats-cron.sh":
               content: !Sub | 
                   #!/bin/bash
@@ -460,12 +425,6 @@ Resources:
                       aws cloudwatch put-metric-data --metric-name "$name" --namespace Proxy --dimensions InstanceID="$instanceId" --value "$value"  --region $region
                   done
               mode: '000755'
-              owner: "root"
-              group: "root"
-            "/etc/squid/squid.allowed.sites.txt":
-              content: | 
-                .amazon.com
-              mode: '000400'
               owner: "root"
               group: "root"
             "/etc/squid/squid.conf":
@@ -527,24 +486,11 @@ Resources:
                  # Example rule allowing access from your local networks.
                  # Adapt localnet in the ACL section to list your (internal) IP networks
                  # from where browsing should be allowed
-                 acl allowed_http_sites dstdomain "/etc/squid/squid.allowed.sites.txt"
-                 http_access allow allowed_http_sites
-                 #http_access allow localnet
-                 #http_access allow localhost
-
-                 # And finally deny all other access to this proxy
-                 http_access deny all
+                 # This config allows all sources
 
                  # Squid normally listens to port 3128, but needs to be parametrized here
                  http_port 0.0.0.0:${ProxyPort} ssl-bump cert=/etc/squid/cert.pem
-                 acl allowed_https_sites ssl::server_name "/etc/squid/squid.allowed.sites.txt"
-                 acl step1 at_step SslBump1
-                 acl step2 at_step SslBump2
-                 acl step3 at_step SslBump3
-                 ssl_bump peek step1 all
-                 ssl_bump peek step2 allowed_https_sites
-                 ssl_bump splice step3 allowed_https_sites
-                 ssl_bump terminate step2 all
+                 # This config allows all destinations
 
                  # Uncomment and adjust the following to add a disk cache directory.
                  #cache_dir ufs /var/spool/squid 100 16 256
@@ -634,12 +580,8 @@ Resources:
             aws ec2 associate-address --region ${AWS::Region} --instance-id $(curl -s http://169.254.169.254/latest/meta-data/instance-id) --allocation-id $freeEIP --allow-reassociation || error_exit 'Failed to Associate Elastic IP'
             # generate dummy certificate
             openssl req -x509 -newkey rsa:4096 -keyout /etc/squid/cert.pem -out /etc/squid/cert.pem -days 3650 -subj "/C=XX/ST=XX/L=squid/O=squid/CN=squid" -nodes
-            #  get the whitelisted domain
-            /root/fetch-config-cron.sh
             #  start squit
             systemctl start squid
-            # cron to update whitelist if needed every 5 min 
-            echo "*/5 * * * * /root/fetch-config-cron.sh" | crontab -
             # cron to to get and push proxy stats
             (crontab -l ; echo "*/5 * * * * /root/get-stats-cron.sh") | crontab -
             # set up DNS if needed 
