@@ -448,6 +448,7 @@ Resources:
 
 
                  acl SSL_ports port 443
+                 acl SSL_ports port 8443  # non-standard https port for CMP
                  acl Safe_ports port 80		# http
                  acl Safe_ports port 21		# ftp
                  acl Safe_ports port 443		# https
@@ -458,6 +459,7 @@ Resources:
                  acl Safe_ports port 488		# gss-http
                  acl Safe_ports port 591		# filemaker
                  acl Safe_ports port 777		# multiling http
+                 acl Safe_ports port 8443   # non-standard https port for CMP
                  acl CONNECT method CONNECT
 
                  #
