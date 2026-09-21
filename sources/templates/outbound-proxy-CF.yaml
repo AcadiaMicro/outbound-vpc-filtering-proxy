@@ -260,7 +260,8 @@ Resources:
       Cooldown: 120
       LaunchConfigurationName: !Ref OutboundProxyLaunchConfig
       MaxSize: 3
-      MinSize: 1
+      MinSize: 2
+      DesiredCapacity: 2
       TargetGroupARNs:
         - Ref: "NetworkLoadBalancerTargetGroup"
       TerminationPolicies:
@@ -553,6 +554,8 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
             #!/bin/bash -xe
+            # OPS-446 Tier 1: patch base OS packages on every launch (AMI was frozen at 2022 baseline)
+            yum update -y
             yum -y install python-pip
             yum -y install python-setuptools
             yum install -y awscli
