@@ -260,7 +260,8 @@ Resources:
       Cooldown: 120
       LaunchConfigurationName: !Ref OutboundProxyLaunchConfig
       MaxSize: 3
-      MinSize: 1
+      MinSize: 2
+      DesiredCapacity: 2
       TargetGroupARNs:
         - Ref: "NetworkLoadBalancerTargetGroup"
       TerminationPolicies:
