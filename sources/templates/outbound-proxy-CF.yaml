@@ -146,6 +146,9 @@ Resources:
           Action:
           - sts:AssumeRole
       Path: "/"
+      ManagedPolicyArns:
+      # OPS-447: Session Manager access (replaces the temporary port-22 rule)
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
       Policies:
       - PolicyName: LogRolePolicy
         PolicyDocument:
@@ -159,6 +162,9 @@ Resources:
                 - logs:DescribeLogStreams
             Resource:
              - !GetAtt OutboundProxyLogGroup.Arn
+      # OPS-447: scoped. AssociateAddress authorizes against the elastic-ip AND the
+      # instance (and/or network-interface), so all three resource types are listed.
+      # The two removed policies (RevokeAuthorizeSG, CloudWatchMetric) had no users.
       - PolicyName: AssociateEIP
         PolicyDocument:
           Version: '2012-10-17'
@@ -166,27 +172,27 @@ Resources:
           - Effect: Allow
             Action:
             - ec2:AssociateAddress
-            - ec2:Describe*
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPa.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPb.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPc.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPd.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+          - Effect: Allow
+            Action:
+            # Describe* cannot be resource-scoped
+            - ec2:DescribeAddresses
             Resource:
             - "*"
-      - PolicyName: RevokeAuthorizeSG
+      - PolicyName: TargetHealthRead
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
           - Effect: Allow
             Action:
-            - ec2:RevokeSecurityGroupIngress
-            - ec2:AuthorizeSecurityGroupIngress
-            - ec2:Describe*
-            Resource:
-            - "*"
-      - PolicyName: CloudWatchMetric
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action: 
-            - cloudwatch:PutMetricData
+            # used by the boot-time signal gate: signal only once this instance is healthy in the NLB
+            - elasticloadbalancing:DescribeTargetHealth
             Resource:
             - "*"
 
