@@ -79,8 +79,8 @@ Parameters:
 
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
-    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
-    Description: AMI ID pointer in SSM. Default latest AMI Amazon Linux2.   
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: AMI ID pointer in SSM. Default latest Amazon Linux 2023. For rollback to AL2 use /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 (user-data and squid.conf run on both).
 
 Metadata:
   'AWS::CloudFormation::Interface':
