@@ -11,6 +11,13 @@ Description: Outbound filtering proxy
 
 Parameters:
 
+  NamePrefix:
+    Type: String
+    Default: ''
+    # NLB and target group names are capped at 32 chars: 'OutboundProxyLoadBalancer' is 25, so max 7 here.
+    AllowedPattern: ^([A-Za-z0-9][A-Za-z0-9-]{0,6})?$
+    Description: Prefix for NLB, target group and export names. Leave empty for the production stack; use e.g. Sbx- for a sandbox copy so names do not collide.
+
   CustomDNS:
     Type: String
     Default: default
@@ -72,8 +79,8 @@ Parameters:
 
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
-    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
-    Description: AMI ID pointer in SSM. Default latest AMI Amazon Linux2.   
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: AMI ID pointer in SSM. Default latest Amazon Linux 2023. For rollback to AL2 use /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 (user-data and squid.conf run on both).
 
 Metadata:
   'AWS::CloudFormation::Interface':
@@ -139,6 +146,9 @@ Resources:
           Action:
           - sts:AssumeRole
       Path: "/"
+      ManagedPolicyArns:
+      # OPS-447: Session Manager access (replaces the temporary port-22 rule)
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
       Policies:
       - PolicyName: LogRolePolicy
         PolicyDocument:
@@ -152,6 +162,9 @@ Resources:
                 - logs:DescribeLogStreams
             Resource:
              - !GetAtt OutboundProxyLogGroup.Arn
+      # OPS-447: scoped. AssociateAddress authorizes against the elastic-ip AND the
+      # instance (and/or network-interface), so all three resource types are listed.
+      # The two removed policies (RevokeAuthorizeSG, CloudWatchMetric) had no users.
       - PolicyName: AssociateEIP
         PolicyDocument:
           Version: '2012-10-17'
@@ -159,47 +172,55 @@ Resources:
           - Effect: Allow
             Action:
             - ec2:AssociateAddress
-            - ec2:Describe*
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPa.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPb.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPc.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${FixedEIPd.AllocationId}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+          - Effect: Allow
+            Action:
+            # Describe* cannot be resource-scoped
+            - ec2:DescribeAddresses
             Resource:
             - "*"
-      - PolicyName: RevokeAuthorizeSG
+      - PolicyName: TargetHealthRead
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
           - Effect: Allow
             Action:
-            - ec2:RevokeSecurityGroupIngress
-            - ec2:AuthorizeSecurityGroupIngress
-            - ec2:Describe*
-            Resource:
-            - "*"
-      - PolicyName: CloudWatchMetric
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action: 
-            - cloudwatch:PutMetricData
+            # used by the boot-time signal gate: signal only once this instance is healthy in the NLB
+            - elasticloadbalancing:DescribeTargetHealth
             Resource:
             - "*"
 
   FixedEIPa:
     Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Domain: vpc
   
   FixedEIPb:
     Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Domain: vpc
 
   FixedEIPc:
     Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Domain: vpc
 
   FixedEIPd:
     Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Domain: vpc
 
@@ -208,13 +229,13 @@ Resources:
     Properties:
       Scheme: internal
       Type: network
-      Name: OutboundProxyLoadBalancer
+      Name: !Sub '${NamePrefix}OutboundProxyLoadBalancer'
       Subnets: !Ref PrivateSubnetIDs
   
   NetworkLoadBalancerTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: OutboundProxyTargetGroup
+      Name: !Sub '${NamePrefix}OutboundProxyTargetGroup'
       Port: !Ref ProxyPort
       Protocol: TCP
       VpcId: !Ref VpcId
@@ -258,7 +279,11 @@ Resources:
     Properties:
       VPCZoneIdentifier: !Ref PublicSubnetIDs
       Cooldown: 120
-      LaunchConfigurationName: !Ref OutboundProxyLaunchConfig
+      # $Latest/$Default are not supported in CFN. Any change to the LaunchTemplate (even a
+      # user-data comment) bumps LatestVersionNumber and triggers a full terminate-first roll.
+      LaunchTemplate:
+        LaunchTemplateId: !Ref OutboundProxyLaunchTemplate
+        Version: !GetAtt OutboundProxyLaunchTemplate.LatestVersionNumber
       MaxSize: 3
       MinSize: 2
       DesiredCapacity: 2
@@ -279,7 +304,8 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Timeout: PT15M
-        Count: '1'
+        # create-time only (ignored on updates). Was '1' with DesiredCapacity 2 (latent bug).
+        Count: '2'
     UpdatePolicy:
       AutoScalingScheduledAction:
         IgnoreUnmodifiedGroupSizeProperties: true
@@ -288,8 +314,13 @@ Resources:
         MaxBatchSize: 1
         PauseTime: PT15M
         WaitOnResourceSignals: 'true'
+        # OPS-447: also stop CPU-alarm scale-out, AZ rebalancing and health replacement from
+        # launching an extra instance mid-roll (two concurrent boots could race for an EIP)
         SuspendProcesses:
         - ScheduledActions
+        - AlarmNotification
+        - AZRebalance
+        - ReplaceUnhealthy
 
   ScaleOutPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
@@ -347,254 +378,182 @@ Resources:
       ComparisonOperator:  LessThanThreshold
       MetricName: CPUUtilization
 
-  OutboundProxyLaunchConfig:
-    Type: AWS::AutoScaling::LaunchConfiguration
-    Metadata:
-      Comment: Configures Outbound Proxy
-      AWS::CloudFormation::Init:
-        config:
-          files:
-            "/root/update-dns.sh":
-              content: !Sub | 
-                   # DNS List comma delimited 
-                   dns_list="${CustomDNS}"
-                   #
-                   # check if default 
-                   if [[ $dns_list == "default" ]]; then 
-                     exit
-                   fi
-                   #
-                   # split to list 
-                   array=(${!dns_list//,/ })
-                   int_list=`ls /etc/sysconfig/network-scripts/ifcfg-* | grep -v "\-lo$\|old$"`
-                   
-                   # for all interfaces except lookback 
-                   for int in ${!int_list[@]}
-                   do
-                         # remove spaces 
-                         $int=${!int//[[:blank:]]/}
-                         echo "working on $int"
-                         # make tmp file without DNS settings
-                         grep -ve "PEERDNS=\|DNS.=" $int > ./tmp.int.conf
-                         grep -v "nameserver" /etc/resolv.conf  > ./tmp.resolv.conf
-                         echo "PEERDNS=yes" >> ./tmp.int.conf
-                         counter=1
-                         for i in ${!array[@]}
-                         do
-                             echo "DNS${!counter}=${!i}" >> ./tmp.int.conf
-                             echo "nameserver ${!i}" >> ./tmp.resolv.conf
-                             ((counter++))
-                         done
-                         # update the interface config 
-                         mv $int ${!int}.old
-                         cp ./tmp.int.conf $int
-                   done
-                   # update the resolv.conf 
-                   mv /etc/resolv.conf  /etc/resolv.conf.old
-                   cp ./tmp.resolv.conf /etc/resolv.conf
-                   # clear squid cache if squid is running. Relevant for dns content filtering
-                   # systemctl status squid && systemctl stop squid && rm -rf /var/spool/squid/ && squid -z && systemctl start squid 
-                   echo "done"
-              mode: '000755'
-              owner: "root"
-              group: "root"
-            "/etc/awslogs/awscli.conf":
-              content: !Sub | 
-                [plugins]
-                cwlogs = cwlogs
-                [default]
-                region = ${AWS::Region}
-              mode: '000755'
-              owner: "root"
-              group: "root"
-            "/root/get-stats-cron.sh":
-              content: !Sub | 
-                  #!/bin/bash
-                  #
-                  # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-                  # SPDX-License-Identifier: MIT-0#
-                  #
-                  # gets statistics from squid proxy and pushes them to CloudWatch
-                  #
-                  ###
-                  region=`curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document | grep region | cut -f 4 -d '"'`
-                  instanceId=`curl --silent http://169.254.169.254/latest/meta-data/instance-id`
-                  
-                  squidclient -h localhost cache_object://localhost/ mgr:5min | grep "client_http.request\|client_http.hits\|client_http.errors\|client_http.kbytes_in\|client_http.kbytes_out\|server.all." | while read line ; do
-                      name=`echo $line | cut -d "=" -f 1`
-                      value=`echo $line | cut -d "=" -f 2 | sed "s/[^0-9\.]*//g" `
-                      aws cloudwatch put-metric-data --metric-name "$name" --namespace Proxy --dimensions InstanceID="$instanceId" --value "$value"  --region $region
-                  done
-              mode: '000755'
-              owner: "root"
-              group: "root"
-            "/etc/squid/squid.conf":
-              content: !Sub |
-                 # Recommended minimum configuration:
-                 #
-
-                 # Example rule allowing access from your local networks.
-                 # Adapt to list your (internal) IP networks from where browsing
-                 # should be allowed
-                 acl localnet src 10.0.0.0/8	# RFC1918 possible internal network
-                 acl localnet src 172.16.0.0/12	# RFC1918 possible internal network
-                 acl localnet src 192.168.0.0/16	# RFC1918 possible internal network
-                 acl localnet src fc00::/7       # RFC 4193 local private network range
-                 acl localnet src fe80::/10      # RFC 4291 link-local (directly plugged) machines
-                 acl localnet src 127.0.0.1
-
-                 # The Instance Metadata Service
-                 # (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html#instance-metadata-limiting-access)
-                 acl imds dst 169.254.169.254
-
-
-                 acl SSL_ports port 443
-                 acl SSL_ports port 8443  # non-standard https port for CMP
-                 acl Safe_ports port 80		# http
-                 acl Safe_ports port 21		# ftp
-                 acl Safe_ports port 443		# https
-                 acl Safe_ports port 70		# gopher
-                 acl Safe_ports port 210		# wais
-                 acl Safe_ports port 1025-65535	# unregistered ports
-                 acl Safe_ports port 280		# http-mgmt
-                 acl Safe_ports port 488		# gss-http
-                 acl Safe_ports port 591		# filemaker
-                 acl Safe_ports port 777		# multiling http
-                 acl Safe_ports port 8443   # non-standard https port for CMP
-                 acl CONNECT method CONNECT
-
-                 #
-                 # Recommended minimum Access Permission configuration:
-                 #
-                 # Deny requests to the Instance Metadata Service
-                 http_access deny imds
-
-                 # Deny requests to certain unsafe ports
-                 http_access deny !Safe_ports
-
-                 # Deny CONNECT to other than secure SSL ports
-                 http_access deny CONNECT !SSL_ports
-
-                 # Only allow cachemgr access from localhost
-                 http_access allow localhost manager
-                 http_access deny manager
-
-                 # Deny requests to services running on localhost
-                 http_access deny to_localhost
-
-                 #
-                 # INSERT YOUR OWN RULE(S) HERE TO ALLOW ACCESS FROM YOUR CLIENTS
-                 #
-
-                 # Example rule allowing access from your local networks.
-                 # Adapt localnet in the ACL section to list your (internal) IP networks
-                 # from where browsing should be allowed
-                 # This config allows all sources
-
-                 # Squid normally listens to port 3128, but needs to be parametrized here
-                 http_port 0.0.0.0:${ProxyPort} ssl-bump cert=/etc/squid/cert.pem
-                 # This config allows all destinations
-
-                 # Uncomment and adjust the following to add a disk cache directory.
-                 #cache_dir ufs /var/spool/squid 100 16 256
-
-                 # Leave coredumps in the first cache dir
-                 coredump_dir /var/spool/squid
-                 #
-                 # Add any of your own refresh_pattern entries above these.
-                 #
-                 refresh_pattern ^ftp:		1440	20%	10080
-                 refresh_pattern ^gopher:	1440	0%	1440
-                 refresh_pattern -i (/cgi-bin/|\?) 0	0%	0
-                 refresh_pattern .		0	20%	4320
-            "/etc/awslogs/awslogs.conf":
-              content: !Sub |
-                [general]
-                state_file = /var/lib/awslogs/agent-state
-                [/var/log/squid/access.log]
-                file = /var/log/squid/access.log
-                log_group_name = ${OutboundProxyLogGroup}
-                log_stream_name = {instance_id}/squid_access.log
-                #datetime_format = %d/%b/%Y:%H:%M:%S
-              mode: '000400'
-              owner: "root"
-              group: "root"
-            "/etc/cfn/cfn-hup.conf":
-              content: !Sub |
-                [main]
-                stack= ${AWS::StackId}
-                region=${AWS::Region}
-                interval=5
-              mode: "000400"
-              owner: "root"
-              group: "root"
-            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
-              content: !Sub |
-                [cfn-auto-reloader-hook]
-                triggers=post.update
-                path=Resources.OutboundProxyLaunchConfig.Metadata.AWS::CloudFormation::Init
-                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource OutboundProxyLaunchConfig --region ${AWS::Region}
-                runas=root
-              mode: "000400"
-              owner: "root"
-              group: "root"
+  # OPS-447: replaces AWS::AutoScaling::LaunchConfiguration (deprecated) and the cfn-init/cfn-hup
+  # metadata. Files are written from user-data, so any config change is a new LaunchTemplate
+  # version and an immutable roll. User-data is written to run unchanged on AL2 and AL2023, so
+  # rollback is just LatestAmiId -> the AL2 SSM path.
+  OutboundProxyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
     Properties:
-      AssociatePublicIpAddress: True
-      ImageId:  !Ref LatestAmiId
-      InstanceType: !Ref InstanceType
-      KeyName: !If 
-         - AddSSHKey
-         - !Ref KeyName
-         - !Ref "AWS::NoValue"  
-      SecurityGroups:
-      - !Ref OutboundProxySecurityGroup
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !If
+          - AddSSHKey
+          - !Ref KeyName
+          - !Ref "AWS::NoValue"
+        IamInstanceProfile:
+          Arn: !GetAtt OutboundProxyProfile.Arn
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        # SGs must live in the network interface when AssociatePublicIpAddress is set here.
+        # No SubnetId: the ASG's VPCZoneIdentifier chooses the subnet.
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            Groups:
+              - !Ref OutboundProxySecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -Eeuxo pipefail
 
-      IamInstanceProfile:
-        Ref: OutboundProxyProfile
-      UserData:
-        Fn::Base64: !Sub |
-            #!/bin/bash -xe
-            # OPS-446 Tier 1: patch base OS packages on every launch (AMI was frozen at 2022 baseline)
-            yum update -y
-            yum -y install python-pip
-            yum -y install python-setuptools
-            yum install -y awscli
-            # install squid
-            yum install -y squid
-            # install the CloudWatch Logs agent
-            yum install -y awslogs
-            # Get the latest CloudFormation package
-            easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
-            # Start cfn-init
-            /opt/aws/bin/cfn-init -s ${AWS::StackId} -r OutboundProxyLaunchConfig --region ${AWS::Region} || error_exit 'Failed to run cfn-init'
-            # Start up the cfn-hup daemon to listen for changes to the launch configuration metadata
-            /opt/aws/bin/cfn-hup || error_exit 'Failed to start cfn-hup'
-            # start the cloud watch agent
-            systemctl start awslogsd
-            # get the IP allocation id 
-            EIPs=(${FixedEIPa.AllocationId} ${FixedEIPb.AllocationId} ${FixedEIPc.AllocationId} ${FixedEIPd.AllocationId})
-            for i in ${!EIPs[@]}; do
-               out=$(aws ec2  describe-addresses --region ${AWS::Region} --allocation-ids $i) 
-               if [[ $out != *AssociationId* ]]; then 
-                     freeEIP=$i
-                     break
-               fi
+            # 1. cfn-bootstrap first, so error_exit can signal a failure instead of waiting out PauseTime
+            yum install -y aws-cfn-bootstrap
+            error_exit() {
+              /opt/aws/bin/cfn-signal -e 1 --stack "${AWS::StackName}" --resource OutboundProxyASG --region "${AWS::Region}" --reason "$1" || true
+              exit 1
+            }
+            trap 'error_exit "user-data failed at line $LINENO"' ERR
+
+            # IMDSv2 token helper (also works on AL2)
+            imds() {
+              local t
+              t=$(curl -sS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+              curl -sS -H "X-aws-ec2-metadata-token: $t" "http://169.254.169.254/latest/$1"
+            }
+            INSTANCE_ID=$(imds meta-data/instance-id)
+            echo "instance $INSTANCE_ID; CustomDNS=${CustomDNS} (unused since OPS-447)"
+
+            # 2. packages (no yum update here: patching comes from the AMI via LatestAmiId)
+            yum install -y squid amazon-cloudwatch-agent
+            command -v aws >/dev/null || yum install -y awscli
+
+            # 3. squid.conf: must parse on squid 3.5 (AL2) and 6.x (AL2023)
+            cat > /etc/squid/squid.conf <<'SQUIDCONF'
+            acl localnet src 10.0.0.0/8
+            acl localnet src 172.16.0.0/12
+            acl localnet src 192.168.0.0/16
+            acl localnet src fc00::/7
+            acl localnet src fe80::/10
+
+            # metadata service and all link-local (explicit acl so this parses on squid 3.5 and 6)
+            acl linklocal dst 169.254.0.0/16
+
+            acl SSL_ports port 443
+            # 8443 = CMP; unused in 30d but kept (removal would be a behaviour change)
+            acl SSL_ports port 8443
+            # 8443 omitted here: already inside 1025-65535 (avoids an overlap warning)
+            acl Safe_ports port 80 21 443 70 210 1025-65535 280 488 591 777
+            # not named CONNECT: squid 3.5 has no built-in CONNECT, squid 6 does
+            acl connect_method method CONNECT
+
+            http_access deny linklocal
+            http_access deny !Safe_ports
+            http_access deny connect_method !SSL_ports
+            http_access allow localhost manager
+            http_access deny manager
+            http_access deny to_localhost
+            # explicit allows (3.5 relied on implicit default-allow) + terminal deny
+            http_access allow localnet
+            # needed: the on-box signal gate and V3 curl via -x 127.0.0.1:${ProxyPort}
+            http_access allow localhost
+            http_access deny all
+
+            # ssl-bump removed: no ssl_bump rules existed; 100% TCP_TUNNEL in logs
+            http_port 0.0.0.0:${ProxyPort}
+            coredump_dir /var/spool/squid
+            refresh_pattern ^ftp: 1440 20% 10080
+            refresh_pattern -i (/cgi-bin/|\?) 0 0% 0
+            refresh_pattern . 0 20% 4320
+            SQUIDCONF
+            squid -k parse
+
+            # 4. CloudWatch agent: ship squid access.log to the existing log group (same stream name as before)
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/proxy.json <<'CWCONF'
+            {
+              "agent": { "run_as_user": "root" },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/squid/access.log",
+                        "log_group_name": "${OutboundProxyLogGroup}",
+                        "log_stream_name": "{instance_id}/squid_access.log"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            CWCONF
+
+            # 5. race-safe EIP association: never steal an EIP held by another instance
+            EIP_ALLOCS="${FixedEIPa.AllocationId} ${FixedEIPb.AllocationId} ${FixedEIPc.AllocationId} ${FixedEIPd.AllocationId}"
+            ASSOCIATED=""
+            for _attempt in 1 2 3 4 5 6; do
+              for A in $EIP_ALLOCS; do
+                CUR=$(aws ec2 describe-addresses --region ${AWS::Region} --allocation-ids "$A" --query 'Addresses[0].AssociationId' --output text 2>/dev/null) || CUR=ERR
+                if [ "$CUR" = "None" ]; then
+                  if aws ec2 associate-address --region ${AWS::Region} --instance-id "$INSTANCE_ID" --allocation-id "$A" --no-allow-reassociation >/dev/null 2>&1; then
+                    ASSOCIATED=$A
+                    break 2
+                  fi
+                fi
+              done
+              sleep 5
             done
-            # bind the address 
-            echo "binding EIP"
-            aws ec2 associate-address --region ${AWS::Region} --instance-id $(curl -s http://169.254.169.254/latest/meta-data/instance-id) --allocation-id $freeEIP --allow-reassociation || error_exit 'Failed to Associate Elastic IP'
-            # generate dummy certificate
-            openssl req -x509 -newkey rsa:4096 -keyout /etc/squid/cert.pem -out /etc/squid/cert.pem -days 3650 -subj "/C=XX/ST=XX/L=squid/O=squid/CN=squid" -nodes
-            #  start squit
+            [ -n "$ASSOCIATED" ] || error_exit "no free EIP could be associated"
+            echo "associated $ASSOCIATED"
+
+            # 6. start services (enable && start, not enable --now: AL2 has systemd 219)
+            systemctl enable squid
             systemctl start squid
-            # cron to to get and push proxy stats
-            (crontab -l ; echo "*/5 * * * * /root/get-stats-cron.sh") | crontab -
-            # set up DNS if needed 
-            if [[ ${CustomDNS} != "default" ]]; then
-                /root/update-dns.sh
-            fi 
-            # All done so signal success
-            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource OutboundProxyASG --region ${AWS::Region}
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/proxy.json -s
+
+            # 7. signal gate: only things this instance controls. A slow third-party site must not roll back the migration.
+            PROXY="http://127.0.0.1:${ProxyPort}"
+            for _try in $(seq 1 30); do systemctl is-active --quiet squid && break; sleep 2; done
+            systemctl is-active --quiet squid || error_exit "gate: squid not active"
+
+            # (3) egress IP must be one of this stack's 4 EIPs (EIP propagation can take a few seconds)
+            EIP_IPS=" ${FixedEIPa} ${FixedEIPb} ${FixedEIPc} ${FixedEIPd} "
+            EGRESS=""
+            for _try in $(seq 1 12); do
+              EGRESS=$(curl -sS -m 15 -x "$PROXY" https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]') || EGRESS=""
+              case "$EIP_IPS" in *" $EGRESS "*) [ -n "$EGRESS" ] && break ;; esac
+              sleep 5
+            done
+            case "$EIP_IPS" in *" $EGRESS "*) [ -n "$EGRESS" ] || error_exit "gate: empty egress ip" ;; *) error_exit "gate: egress ip [$EGRESS] is not one of the stack EIPs" ;; esac
+            echo "egress ip $EGRESS ok"
+
+            # (4) a GCP API is reachable through the proxy
+            GCODE=$(curl -sS -m 20 -x "$PROXY" -o /dev/null -w '%{http_connect}' https://oauth2.googleapis.com 2>/dev/null) || GCODE=""
+            [ "$GCODE" = "200" ] || error_exit "gate: googleapis CONNECT returned [$GCODE]"
+
+            # utility sites: logged, NON-gating
+            for H in ebiz1.nyseg.com secure.comed.com www.ameren.com; do
+              UCODE=$(curl -sS -m 10 -x "$PROXY" -o /dev/null -w '%{http_connect}' "https://$H/" 2>/dev/null) || UCODE=fail
+              echo "utility check $H connect=$UCODE (informational)"
+            done
+
+            # (5) wait until this instance is healthy in the NLB target group, so a terminate-first
+            # roll never removes the last healthy target before this one is serving
+            HEALTHY=no
+            for _try in $(seq 1 30); do
+              ST=$(aws elbv2 describe-target-health --region ${AWS::Region} --target-group-arn ${NetworkLoadBalancerTargetGroup} --targets Id="$INSTANCE_ID" --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text 2>/dev/null) || ST=unregistered
+              echo "target health: $ST"
+              if [ "$ST" = "healthy" ]; then HEALTHY=yes; break; fi
+              sleep 10
+            done
+            [ "$HEALTHY" = "yes" ] || error_exit "gate: instance not healthy in target group after 300s"
+
+            trap - ERR
+            /opt/aws/bin/cfn-signal -e 0 --stack "${AWS::StackName}" --resource OutboundProxyASG --region "${AWS::Region}"
             echo "User data done"
 
   OutboundProxyLogGroup:
@@ -608,52 +567,52 @@ Outputs:
     Description: The name of the CloudWatch log group for outbound proxy
     Value: !Ref OutboundProxyLogGroup
     Export:
-      Name: Proxy-CloudWatchLogGroupName
+      Name: !Sub '${NamePrefix}Proxy-CloudWatchLogGroupName'
 
   OutboundProxyDomain:
     Description: Proxy DNS name to be used in the clients 
     Value: !GetAtt LoadBalancer.DNSName
     Export: 
-        Name: Proxy-Domain
+        Name: !Sub '${NamePrefix}Proxy-Domain'
 
   OutboundProxyPort:
     Description: Port of the Proxy 
     Value: !Ref ProxyPort
     Export:
-      Name: Proxy-Port
+      Name: !Sub '${NamePrefix}Proxy-Port'
   
   EgressIP1:
     Description: Outbound Proxy source IP (first)
     Value: !Ref FixedEIPa
     Export: 
-        Name: Proxy-Egress-IP-1
+        Name: !Sub '${NamePrefix}Proxy-Egress-IP-1'
   EgressIP2:
     Description: Outbound Proxy source IP (second)
     Value: !Ref FixedEIPb
     Export: 
-        Name: Proxy-Egress-IP-2
+        Name: !Sub '${NamePrefix}Proxy-Egress-IP-2'
   EgressIP3:
     Description: Outbound Proxy source IP (third) 
     Value: !Ref FixedEIPc
     Export: 
-        Name: Proxy-Egress-IP-3
+        Name: !Sub '${NamePrefix}Proxy-Egress-IP-3'
   EgressIP4:
     Description: Outbound Proxy source IP (fourth)
     Value: !Ref FixedEIPd
     Export: 
-        Name: Proxy-Egress-IP-4
+        Name: !Sub '${NamePrefix}Proxy-Egress-IP-4'
 
   SecurityGroupProxy:
     Description: Proxy security group 
     Value: SecurityGroup_Proxy
     Export: 
-        Name: Proxy-SecurityGroup
+        Name: !Sub '${NamePrefix}Proxy-SecurityGroup'
 
   LinuxProxySettings:
     Description: Linux proxy settings. Copy and paste to your shell to set the proxy
     Value: !Sub "export http_proxy=http://${LoadBalancer.DNSName}:${ProxyPort} && export https_proxy=$http_proxy"
     Export: 
-      Name: LinuxProxySettings
+      Name: !Sub '${NamePrefix}LinuxProxySettings'
 
 
 
