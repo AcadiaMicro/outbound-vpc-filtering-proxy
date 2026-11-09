@@ -449,9 +449,8 @@ Resources:
             acl linklocal dst 169.254.0.0/16
 
             acl SSL_ports port 443
-            # 8443 = CMP; unused in 30d but kept (removal would be a behaviour change)
-            acl SSL_ports port 8443
-            # 8443 omitted here: already inside 1025-65535 (avoids an overlap warning)
+            # OPS-545: 8443 (added 2022 for CMP) removed; no CONNECT to 8443 in the proxy log
+            # and current CMP code uses only 443. A blocked request fails fast with 403.
             acl Safe_ports port 80 21 443 70 210 1025-65535 280 488 591 777
             # not named CONNECT: squid 3.5 has no built-in CONNECT, squid 6 does
             acl connect_method method CONNECT
