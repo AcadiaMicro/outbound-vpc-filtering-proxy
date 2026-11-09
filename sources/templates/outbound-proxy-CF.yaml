@@ -279,6 +279,11 @@ Resources:
     Properties:
       VPCZoneIdentifier: !Ref PublicSubnetIDs
       Cooldown: 120
+      # OPS-543: replace an instance whose squid stops answering (NLB TCP check), not only a
+      # dead VM. Grace covers boot + the user-data gate's own 300s wait for NLB healthy.
+      # Rolling updates are unaffected: UpdatePolicy suspends ReplaceUnhealthy during a roll.
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
       # $Latest/$Default are not supported in CFN. Any change to the LaunchTemplate (even a
       # user-data comment) bumps LatestVersionNumber and triggers a full terminate-first roll.
       LaunchTemplate:
